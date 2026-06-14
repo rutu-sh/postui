@@ -130,7 +130,7 @@ Format: a top-level JSON array. Each element is one `SavedRequest`. Hand-edit th
 ```bash
 cargo run
 ```
-No CLI args. Default URL is hardcoded to `https://me.rutu-sh.com` in `App::default()` for quick smoke-testing — change as needed.
+No CLI args. URL starts empty; user types one in.
 
 ## Debugging
 TUIs are painful to debug in-process. `eprintln!` corrupts the terminal in raw mode. For state issues, append to a file:

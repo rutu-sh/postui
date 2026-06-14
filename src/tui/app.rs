@@ -268,7 +268,7 @@ impl Default for KvColumn {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct KvRow {
     enabled: bool,
     key: String,
@@ -620,11 +620,19 @@ pub struct App {
     current_request_idx: Option<usize>,
     renaming: Option<RenameState>,
     rename_input_area: Cell<Rect>,
+    path_input: Option<PathInputState>,
+    footer_area: Cell<Rect>,
 }
 
 #[derive(Debug)]
 struct RenameState {
     target: usize,
+    text: String,
+    cursor: usize,
+}
+
+#[derive(Debug)]
+struct PathInputState {
     text: String,
     cursor: usize,
 }
@@ -646,8 +654,8 @@ impl SidebarCursor {
 
 impl Default for App {
     fn default() -> Self {
-        let url = String::from("https://me.rutu-sh.com");
-        let url_cursor = url.len();
+        let url = String::new();
+        let url_cursor = 0;
         Self {
             name: "postui".into(),
             exit: false,
@@ -683,6 +691,8 @@ impl Default for App {
             current_request_idx: None,
             renaming: None,
             rename_input_area: Cell::new(Rect::default()),
+            path_input: None,
+            footer_area: Cell::new(Rect::default()),
         }
     }
 }
@@ -701,6 +711,8 @@ impl App {
         frame.render_widget(self, frame.area());
         if self.method_dropdown_open {
             self.render_method_dropdown(frame);
+        } else if self.path_input.is_some() {
+            self.render_path_input_cursor(frame);
         } else if self.focus == Focus::Url {
             self.render_url_cursor(frame);
         } else if self.focus == Focus::Params
@@ -746,6 +758,16 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.exit();
+            return;
+        }
+
+        if self.path_input.is_some() {
+            self.handle_path_input_key(key);
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -757,7 +779,7 @@ impl App {
                     return;
                 }
                 KeyCode::Char('o') => {
-                    self.reload_collection();
+                    self.start_load_path_input();
                     return;
                 }
                 KeyCode::Char('b') => {
@@ -1058,7 +1080,23 @@ impl App {
             }
             KeyCode::Home | KeyCode::Char('g') => self.response_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.response_scroll = max,
+            KeyCode::Char('c') | KeyCode::Char('y') => self.copy_response(),
             _ => {}
+        }
+    }
+
+    fn copy_response(&mut self) {
+        let body = match &self.response {
+            ResponseState::Done(d) => d.body.clone(),
+            ResponseState::Error(e) => e.clone(),
+            _ => {
+                self.set_status("nothing to copy".into());
+                return;
+            }
+        };
+        match copy_to_clipboard(&body) {
+            Ok(()) => self.set_status(format!("copied {} bytes", body.len())),
+            Err(e) => self.set_status(format!("copy failed — {e}")),
         }
     }
 
@@ -1208,6 +1246,70 @@ impl App {
                     if let Some(rename) = self.renaming.as_mut() {
                         rename.text.insert(rename.cursor, c);
                         rename.cursor += c.len_utf8();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_path_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.path_input = None;
+            }
+            KeyCode::Enter => {
+                if let Some(input) = self.path_input.take() {
+                    self.reload_collection_from(&input.text);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(input) = self.path_input.as_mut() {
+                    if input.cursor > 0 {
+                        let prev = input.text[..input.cursor].chars().next_back().unwrap();
+                        input.cursor -= prev.len_utf8();
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(input) = self.path_input.as_mut() {
+                    if input.cursor < input.text.len() {
+                        let next = input.text[input.cursor..].chars().next().unwrap();
+                        input.cursor += next.len_utf8();
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(input) = self.path_input.as_mut() {
+                    input.cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(input) = self.path_input.as_mut() {
+                    input.cursor = input.text.len();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(input) = self.path_input.as_mut() {
+                    if input.cursor > 0 {
+                        let prev = input.text[..input.cursor].chars().next_back().unwrap();
+                        input.cursor -= prev.len_utf8();
+                        input.text.remove(input.cursor);
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(input) = self.path_input.as_mut() {
+                    if input.cursor < input.text.len() {
+                        input.text.remove(input.cursor);
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                    if let Some(input) = self.path_input.as_mut() {
+                        input.text.insert(input.cursor, c);
+                        input.cursor += c.len_utf8();
                     }
                 }
             }
@@ -1409,6 +1511,20 @@ impl App {
         self.exit = true;
     }
 
+    fn is_current_dirty(&self) -> bool {
+        let Some(idx) = self.current_request_idx else {
+            return false;
+        };
+        let Some(saved) = self.requests.get(idx) else {
+            return false;
+        };
+        saved.method != self.method
+            || saved.url != self.url
+            || !kv_rows_equivalent(&saved.params, &self.params_kv.rows)
+            || !kv_rows_equivalent(&saved.headers, &self.headers_kv.rows)
+            || saved.body != self.body_buf.text()
+    }
+
     fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now()));
     }
@@ -1463,25 +1579,47 @@ impl App {
         }
     }
 
-    fn reload_collection(&mut self) {
-        self.requests = load_collection_from_disk();
-        if self.requests.is_empty() {
-            self.sidebar_cursor = SidebarCursor::NewRequest;
-            self.current_request_idx = None;
-        } else {
-            if let SidebarCursor::Saved(i) = self.sidebar_cursor {
-                if i >= self.requests.len() {
-                    self.sidebar_cursor = SidebarCursor::Saved(self.requests.len() - 1);
-                }
-            }
-            if let Some(idx) = self.current_request_idx {
-                if idx >= self.requests.len() {
+    fn start_load_path_input(&mut self) {
+        let initial = collection_file_path().to_string_lossy().to_string();
+        let cursor = initial.len();
+        self.path_input = Some(PathInputState { text: initial, cursor });
+    }
+
+    fn reload_collection_from(&mut self, path_str: &str) {
+        let expanded = expand_tilde(path_str);
+        let path = std::path::Path::new(&expanded);
+        let result = std::fs::read_to_string(path)
+            .map_err(|e| format!("read: {e}"))
+            .and_then(|s| {
+                serde_json::from_str::<Vec<SavedRequest>>(&s).map_err(|e| format!("parse: {e}"))
+            });
+        match result {
+            Ok(loaded) => {
+                self.requests = loaded;
+                if self.requests.is_empty() {
+                    self.sidebar_cursor = SidebarCursor::NewRequest;
                     self.current_request_idx = None;
+                } else {
+                    if let SidebarCursor::Saved(i) = self.sidebar_cursor {
+                        if i >= self.requests.len() {
+                            self.sidebar_cursor = SidebarCursor::Saved(self.requests.len() - 1);
+                        }
+                    }
+                    if let Some(idx) = self.current_request_idx {
+                        if idx >= self.requests.len() {
+                            self.current_request_idx = None;
+                        }
+                    }
                 }
+                self.renaming = None;
+                self.set_status(format!(
+                    "loaded {} requests from {}",
+                    self.requests.len(),
+                    expanded
+                ));
             }
+            Err(e) => self.set_status(format!("load failed — {e}")),
         }
-        self.renaming = None;
-        self.set_status(format!("reloaded ({} requests)", self.requests.len()));
     }
 
     fn persist_collection(&self) -> Result<(), String> {
@@ -1626,6 +1764,12 @@ impl App {
             0
         };
 
+        let dirty_idx: Option<usize> = if self.is_current_dirty() {
+            self.current_request_idx
+        } else {
+            None
+        };
+
         let method_w: u16 = 8;
         for display_i in 0..max_items {
             let logical_row = scroll + display_i;
@@ -1696,8 +1840,24 @@ impl App {
                 continue;
             }
 
+            let is_dirty = dirty_idx == Some(i);
             let label = req.name.clone().unwrap_or_else(|| req.url.clone());
-            let marker = if is_current { "●" } else { " " };
+            let marker = if is_dirty {
+                "*"
+            } else if is_current {
+                "●"
+            } else {
+                " "
+            };
+            let marker_style = if is_dirty {
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            };
             let label_w = row_area.width.saturating_sub(method_w + 3) as usize;
             let label_disp = if label_w == 0 {
                 String::new()
@@ -1705,16 +1865,17 @@ impl App {
                 truncate_for_display(&label, label_w)
             };
 
-            let label_style = if is_current {
+            let label_style = if is_dirty {
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_current {
                 Style::default()
                     .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let marker_style = Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD);
 
             let line = Line::from(vec![
                 Span::styled(marker.to_string(), marker_style),
@@ -1733,6 +1894,22 @@ impl App {
             ]);
             Paragraph::new(line).render(row_area, buf);
         }
+    }
+
+    fn render_path_input_cursor(&self, frame: &mut Frame) {
+        let Some(input) = &self.path_input else {
+            return;
+        };
+        let area = self.footer_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let label_width = " Load from:  ".chars().count() as u16;
+        let pos = input.cursor.min(input.text.len());
+        let char_offset = input.text[..pos].chars().count() as u16;
+        let max_x = area.x + area.width.saturating_sub(1);
+        let cursor_x = (area.x + label_width).saturating_add(char_offset).min(max_x);
+        frame.set_cursor_position((cursor_x, area.y));
     }
 
     fn render_rename_cursor(&self, frame: &mut Frame) {
@@ -2042,26 +2219,45 @@ impl App {
             ResponseState::Error(_) => (" RESPONSE  ERROR ".to_string(), Color::Red),
         };
 
+        let show_icon = matches!(
+            self.response,
+            ResponseState::Done(_) | ResponseState::Error(_)
+        );
+        let icon = "[⧉]";
+        let icon_width = if show_icon { icon.chars().count() } else { 0 };
+
         let total = area.width as usize;
         let left_dashes = 1usize;
-        let title_room = total.saturating_sub(2 + left_dashes);
+        let title_room = total.saturating_sub(2 + left_dashes + icon_width);
         let title_trunc: String = title.chars().take(title_room).collect();
         let title_len = title_trunc.chars().count();
-        let right_dashes = total - 2 - left_dashes - title_len;
+        let right_dashes = total - 2 - left_dashes - title_len - icon_width;
 
         let mut title_style = Style::default().fg(title_color).add_modifier(Modifier::BOLD);
         if self.focus == Focus::Response {
             title_style = title_style.bg(Color::DarkGray);
         }
-        let line = Line::from(vec![
+
+        let mut spans = vec![
             Span::raw("├"),
             Span::raw("─".repeat(left_dashes)),
             Span::styled(title_trunc, title_style),
             Span::raw("─".repeat(right_dashes)),
-            Span::raw("┤"),
-        ]);
+        ];
+        if show_icon {
+            let icon_style = if self.focus == Focus::Response {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(icon, icon_style));
+        }
+        spans.push(Span::raw("┤"));
 
-        Paragraph::new(line).render(area, buf);
+        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     fn render_response_body(&self, area: Rect, buf: &mut Buffer) {
@@ -2284,6 +2480,85 @@ fn load_collection_from_disk() -> Vec<SavedRequest> {
     }
 }
 
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+
+    #[cfg(target_os = "linux")]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["-b", "-i"]),
+    ];
+
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[("clip", &[])];
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let candidates: &[(&str, &[&str])] = &[];
+
+    let mut last_err = String::new();
+    for (cmd, args) in candidates {
+        let spawned = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                last_err = format!("{cmd}: {e}");
+                continue;
+            }
+        }
+        drop(child.stdin.take());
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_err = format!("{cmd} exited {status}"),
+            Err(e) => last_err = format!("{cmd}: {e}"),
+        }
+    }
+    if last_err.is_empty() {
+        Err("no clipboard command found".into())
+    } else {
+        Err(last_err)
+    }
+}
+
+fn kv_rows_equivalent(a: &[KvRow], b: &[KvRow]) -> bool {
+    let trim = |rows: &[KvRow]| -> Vec<KvRow> {
+        let mut v: Vec<KvRow> = rows.to_vec();
+        while let Some(last) = v.last() {
+            if last.key.is_empty() && last.value.is_empty() {
+                v.pop();
+            } else {
+                break;
+            }
+        }
+        v
+    };
+    trim(a) == trim(b)
+}
+
+fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    s.to_string()
+}
+
 fn truncate_for_display(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -2379,6 +2654,23 @@ impl Widget for &App {
         }
 
         if self.show_footer {
+            self.footer_area.set(vchunks[i]);
+            if let Some(input) = &self.path_input {
+                let label_style = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD);
+                let line = Line::from(vec![
+                    Span::styled(" Load from: ", label_style),
+                    Span::raw(" "),
+                    Span::styled(
+                        input.text.as_str(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                Paragraph::new(line).render(vchunks[i], buf);
+                return;
+            }
             let active_status = self.status_message.as_ref().and_then(|(msg, when)| {
                 if when.elapsed() < Duration::from_secs(3) {
                     Some(msg.as_str())
@@ -2410,7 +2702,7 @@ impl Widget for &App {
                                 _ => " tab/⇧tab: next/prev cell  esc/↑: tabs  enter: next/toggle  space: toggle  ^D: del row ",
                             },
                         },
-                        Focus::Response => " ↑/↓: scroll  PgUp/PgDn: page  Home/End: top/bot  ⇧↑/⇧↓: resize  ^S/^O: save/load ",
+                        Focus::Response => " ↑/↓: scroll  PgUp/PgDn: page  c: copy  Home/End: top/bot  ⇧↑/⇧↓: resize ",
                         Focus::Sidebar => {
                             if self.renaming.is_some() {
                                 " enter: save  esc: cancel  type to edit "
