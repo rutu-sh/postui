@@ -1750,13 +1750,9 @@ impl App {
     }
 
     fn render_body(&self, area: Rect, buf: &mut Buffer) {
-        let has_left_border = !self.show_sidebar;
-        let body_borders = if has_left_border {
-            Borders::LEFT | Borders::TOP | Borders::RIGHT | Borders::BOTTOM
-        } else {
-            Borders::TOP | Borders::RIGHT | Borders::BOTTOM
-        };
-        Block::new().borders(body_borders).render(area, buf);
+        Block::new()
+            .borders(Borders::LEFT | Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
+            .render(area, buf);
 
         if area.width < 4 || area.height < 3 {
             return;
@@ -1770,9 +1766,7 @@ impl App {
         };
         self.render_url_row(url_row_area, buf);
 
-        if has_left_border {
-            buf[(area.x, area.y + 2)].set_symbol("├");
-        }
+        buf[(area.x, area.y + 2)].set_symbol("├");
         buf[(area.x + area.width - 1, area.y + 2)].set_symbol("┤");
 
         if area.height <= 4 {
@@ -2059,9 +2053,8 @@ impl App {
         if self.focus == Focus::Response {
             title_style = title_style.bg(Color::DarkGray);
         }
-        let left_glyph = if self.show_sidebar { "─" } else { "├" };
         let line = Line::from(vec![
-            Span::raw(left_glyph),
+            Span::raw("├"),
             Span::raw("─".repeat(left_dashes)),
             Span::styled(title_trunc, title_style),
             Span::raw("─".repeat(right_dashes)),
