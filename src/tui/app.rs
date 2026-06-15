@@ -2717,3 +2717,443 @@ impl Widget for &App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kv(enabled: bool, key: &str, value: &str) -> KvRow {
+        KvRow {
+            enabled,
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    // ----- TextBuffer -----
+
+    #[test]
+    fn text_buffer_default_has_one_empty_line() {
+        let b = TextBuffer::new();
+        assert_eq!(b.lines, vec![String::new()]);
+        assert_eq!(b.cursor_row, 0);
+        assert_eq!(b.cursor_col, 0);
+        assert_eq!(b.text(), "");
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn text_buffer_from_text_roundtrip() {
+        for s in ["", "abc", "a\nb", "a\n\nb", "α\nβ", "  spaces  "] {
+            let b = TextBuffer::from_text(s);
+            assert_eq!(b.text(), s, "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn text_buffer_insert_char_appends() {
+        let mut b = TextBuffer::new();
+        b.insert_char('a');
+        b.insert_char('b');
+        b.insert_char('c');
+        assert_eq!(b.text(), "abc");
+        assert_eq!(b.cursor_col, 3);
+    }
+
+    #[test]
+    fn text_buffer_insert_newline_splits() {
+        let mut b = TextBuffer::from_text("abc");
+        b.cursor_col = 1;
+        b.insert_newline();
+        assert_eq!(b.text(), "a\nbc");
+        assert_eq!(b.cursor_row, 1);
+        assert_eq!(b.cursor_col, 0);
+    }
+
+    #[test]
+    fn text_buffer_backspace_within_line() {
+        let mut b = TextBuffer::from_text("abc");
+        b.move_end();
+        b.backspace();
+        assert_eq!(b.text(), "ab");
+    }
+
+    #[test]
+    fn text_buffer_backspace_at_line_start_merges_with_prev() {
+        let mut b = TextBuffer::from_text("a\nb");
+        b.cursor_row = 1;
+        b.cursor_col = 0;
+        b.backspace();
+        assert_eq!(b.text(), "ab");
+        assert_eq!(b.cursor_row, 0);
+        assert_eq!(b.cursor_col, 1);
+    }
+
+    #[test]
+    fn text_buffer_delete_within_line() {
+        let mut b = TextBuffer::from_text("abc");
+        b.cursor_col = 0;
+        b.delete();
+        assert_eq!(b.text(), "bc");
+    }
+
+    #[test]
+    fn text_buffer_delete_at_line_end_merges_with_next() {
+        let mut b = TextBuffer::from_text("a\nb");
+        b.cursor_col = 1;
+        b.delete();
+        assert_eq!(b.text(), "ab");
+    }
+
+    #[test]
+    fn text_buffer_move_left_at_line_start_jumps_prev_line_end() {
+        let mut b = TextBuffer::from_text("a\nb");
+        b.cursor_row = 1;
+        b.cursor_col = 0;
+        b.move_left();
+        assert_eq!(b.cursor_row, 0);
+        assert_eq!(b.cursor_col, 1);
+    }
+
+    #[test]
+    fn text_buffer_move_right_at_line_end_jumps_next_line_start() {
+        let mut b = TextBuffer::from_text("a\nb");
+        b.cursor_row = 0;
+        b.cursor_col = 1;
+        b.move_right();
+        assert_eq!(b.cursor_row, 1);
+        assert_eq!(b.cursor_col, 0);
+    }
+
+    #[test]
+    fn text_buffer_move_down_clamps_to_shorter_line() {
+        let mut b = TextBuffer::from_text("longer\nx");
+        b.cursor_row = 0;
+        b.cursor_col = 5;
+        b.move_down();
+        assert_eq!(b.cursor_row, 1);
+        assert_eq!(b.cursor_col, 1);
+    }
+
+    #[test]
+    fn text_buffer_utf8_chars_use_byte_offsets() {
+        let mut b = TextBuffer::new();
+        b.insert_char('α');
+        b.insert_char('β');
+        assert_eq!(b.text(), "αβ");
+        assert_eq!(b.cursor_col, 4);
+        b.move_left();
+        assert_eq!(b.cursor_col, 2);
+    }
+
+    #[test]
+    fn text_buffer_ensure_visible_scrolls_when_cursor_below() {
+        let mut b = TextBuffer::from_text("a\nb\nc\nd\ne");
+        b.cursor_row = 4;
+        b.ensure_visible(2);
+        assert_eq!(b.scroll_y, 3);
+    }
+
+    #[test]
+    fn text_buffer_ensure_visible_scrolls_up_when_cursor_above() {
+        let mut b = TextBuffer::from_text("a\nb\nc\nd\ne");
+        b.scroll_y = 3;
+        b.cursor_row = 1;
+        b.ensure_visible(2);
+        assert_eq!(b.scroll_y, 1);
+    }
+
+    // ----- KvEditor -----
+
+    #[test]
+    fn kv_editor_default_state() {
+        let e = KvEditor::new();
+        assert_eq!(e.rows.len(), 1);
+        assert_eq!(e.cur_row, 0);
+        assert_eq!(e.cur_col, KvColumn::Key);
+        assert_eq!(e.cur_pos, 0);
+        assert!(e.rows[0].enabled);
+        assert!(e.rows[0].key.is_empty());
+        assert!(e.rows[0].value.is_empty());
+    }
+
+    #[test]
+    fn kv_editor_from_rows_empty_synthesizes_placeholder() {
+        let e = KvEditor::from_rows(vec![]);
+        assert_eq!(e.rows.len(), 1);
+        assert_eq!(e.rows[0], KvRow::new());
+    }
+
+    #[test]
+    fn kv_editor_from_rows_preserves_given() {
+        let rows = vec![kv(true, "k", "v"), kv(false, "x", "y")];
+        let e = KvEditor::from_rows(rows.clone());
+        assert_eq!(e.rows, rows);
+    }
+
+    #[test]
+    fn kv_editor_insert_char_only_on_text_cells() {
+        let mut e = KvEditor::new();
+        e.insert_char('k');
+        assert_eq!(e.rows[0].key, "k");
+        e.cur_col = KvColumn::Enabled;
+        e.cur_pos = 0;
+        e.insert_char('x');
+        assert_eq!(e.rows[0].key, "k");
+    }
+
+    #[test]
+    fn kv_editor_advance_cell_walks_key_to_value_to_next_row() {
+        let mut e = KvEditor::new();
+        assert_eq!(e.cur_col, KvColumn::Key);
+        e.advance_cell();
+        assert_eq!(e.cur_col, KvColumn::Value);
+        assert_eq!(e.cur_row, 0);
+        e.advance_cell();
+        assert_eq!(e.rows.len(), 2);
+        assert_eq!(e.cur_row, 1);
+        assert_eq!(e.cur_col, KvColumn::Key);
+    }
+
+    #[test]
+    fn kv_editor_retreat_cell_walks_value_to_key_to_prev_row() {
+        let mut e = KvEditor::from_rows(vec![kv(true, "a", "1"), kv(true, "b", "2")]);
+        e.cur_row = 1;
+        e.cur_col = KvColumn::Value;
+        e.cur_pos = e.rows[1].value.len();
+        e.retreat_cell();
+        assert_eq!(e.cur_row, 1);
+        assert_eq!(e.cur_col, KvColumn::Key);
+        e.retreat_cell();
+        assert_eq!(e.cur_row, 0);
+        assert_eq!(e.cur_col, KvColumn::Value);
+    }
+
+    #[test]
+    fn kv_editor_toggle_enabled_flips() {
+        let mut e = KvEditor::new();
+        assert!(e.rows[0].enabled);
+        e.toggle_enabled();
+        assert!(!e.rows[0].enabled);
+        e.toggle_enabled();
+        assert!(e.rows[0].enabled);
+    }
+
+    #[test]
+    fn kv_editor_delete_current_row_keeps_at_least_one() {
+        let mut e = KvEditor::new();
+        e.insert_char('k');
+        e.delete_current_row();
+        assert_eq!(e.rows.len(), 1);
+        assert_eq!(e.rows[0], KvRow::new());
+        assert_eq!(e.cur_row, 0);
+    }
+
+    #[test]
+    fn kv_editor_delete_current_row_removes_when_multiple() {
+        let mut e = KvEditor::from_rows(vec![kv(true, "a", "1"), kv(true, "b", "2")]);
+        e.cur_row = 0;
+        e.delete_current_row();
+        assert_eq!(e.rows.len(), 1);
+        assert_eq!(e.rows[0].key, "b");
+    }
+
+    #[test]
+    fn kv_editor_entries_filters_disabled_and_empty_keys_and_trims() {
+        let e = KvEditor::from_rows(vec![
+            kv(true, "  a  ", "  1  "),
+            kv(false, "skip", "x"),
+            kv(true, "", "no-key"),
+            kv(true, "b", ""),
+        ]);
+        assert_eq!(
+            e.entries(),
+            vec![("a".into(), "1".into()), ("b".into(), "".into())]
+        );
+    }
+
+    #[test]
+    fn kv_editor_move_left_at_value_start_jumps_to_key_end() {
+        let mut e = KvEditor::from_rows(vec![kv(true, "key", "val")]);
+        e.cur_col = KvColumn::Value;
+        e.cur_pos = 0;
+        e.move_left();
+        assert_eq!(e.cur_col, KvColumn::Key);
+        assert_eq!(e.cur_pos, 3);
+    }
+
+    #[test]
+    fn kv_editor_move_right_at_key_end_jumps_to_value_start() {
+        let mut e = KvEditor::from_rows(vec![kv(true, "key", "val")]);
+        e.cur_col = KvColumn::Key;
+        e.cur_pos = 3;
+        e.move_right();
+        assert_eq!(e.cur_col, KvColumn::Value);
+        assert_eq!(e.cur_pos, 0);
+    }
+
+    // ----- Dirty comparison helper -----
+
+    #[test]
+    fn kv_rows_equivalent_strips_trailing_empties() {
+        let saved = vec![kv(true, "k", "v")];
+        let live = vec![kv(true, "k", "v"), KvRow::new()];
+        assert!(kv_rows_equivalent(&saved, &live));
+    }
+
+    #[test]
+    fn kv_rows_equivalent_detects_difference() {
+        let saved = vec![kv(true, "k", "v")];
+        let live = vec![kv(true, "k", "v2")];
+        assert!(!kv_rows_equivalent(&saved, &live));
+    }
+
+    #[test]
+    fn kv_rows_equivalent_treats_both_empty_as_equal() {
+        let saved: Vec<KvRow> = vec![];
+        let live = vec![KvRow::new()];
+        assert!(kv_rows_equivalent(&saved, &live));
+    }
+
+    #[test]
+    fn kv_rows_equivalent_distinguishes_enabled_flag() {
+        let saved = vec![kv(true, "k", "v")];
+        let live = vec![kv(false, "k", "v")];
+        assert!(!kv_rows_equivalent(&saved, &live));
+    }
+
+    // ----- Free function helpers -----
+
+    #[test]
+    fn expand_tilde_replaces_prefix_with_home() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/foo/bar"), format!("{home}/foo/bar"));
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("relative"), "relative");
+        assert_eq!(expand_tilde(""), "");
+    }
+
+    #[test]
+    fn truncate_for_display_short_returns_unchanged() {
+        assert_eq!(truncate_for_display("abc", 10), "abc");
+        assert_eq!(truncate_for_display("", 5), "");
+    }
+
+    #[test]
+    fn truncate_for_display_long_adds_ellipsis() {
+        let out = truncate_for_display("abcdefghij", 5);
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("abcd"));
+    }
+
+    #[test]
+    fn wrapped_line_count_handles_basic_cases() {
+        assert_eq!(wrapped_line_count("", 10), 1);
+        assert_eq!(wrapped_line_count("abc", 10), 1);
+        assert_eq!(wrapped_line_count("a\nb", 10), 2);
+        assert_eq!(wrapped_line_count("abcdef", 3), 2);
+        assert_eq!(wrapped_line_count("anything", 0), 0);
+    }
+
+    #[test]
+    fn inset_horizontal_shrinks_by_2x_inset() {
+        let r = Rect { x: 5, y: 0, width: 10, height: 1 };
+        let inner = inset_horizontal(r, 2);
+        assert_eq!(inner.x, 7);
+        assert_eq!(inner.width, 6);
+        assert_eq!(inner.y, 0);
+        assert_eq!(inner.height, 1);
+    }
+
+    #[test]
+    fn inset_horizontal_returns_zero_width_when_too_narrow() {
+        let r = Rect { x: 5, y: 0, width: 3, height: 1 };
+        let inner = inset_horizontal(r, 2);
+        assert_eq!(inner.width, 0);
+    }
+
+    #[test]
+    fn status_color_buckets_by_class() {
+        assert_eq!(status_color(200), Color::Green);
+        assert_eq!(status_color(204), Color::Green);
+        assert_eq!(status_color(301), Color::Yellow);
+        assert_eq!(status_color(404), Color::LightRed);
+        assert_eq!(status_color(500), Color::Red);
+        assert_eq!(status_color(999), Color::Gray);
+    }
+
+    // ----- HttpMethod / RequestTab / SidebarCursor -----
+
+    #[test]
+    fn http_method_allows_body_only_for_mutating_verbs() {
+        assert!(!HttpMethod::Get.allows_body());
+        assert!(!HttpMethod::Head.allows_body());
+        assert!(!HttpMethod::Options.allows_body());
+        assert!(HttpMethod::Post.allows_body());
+        assert!(HttpMethod::Put.allows_body());
+        assert!(HttpMethod::Patch.allows_body());
+        assert!(HttpMethod::Delete.allows_body());
+    }
+
+    #[test]
+    fn http_method_as_str() {
+        assert_eq!(HttpMethod::Get.as_str(), "GET");
+        assert_eq!(HttpMethod::Post.as_str(), "POST");
+        assert_eq!(HttpMethod::Options.as_str(), "OPTIONS");
+    }
+
+    #[test]
+    fn sidebar_cursor_saved_index() {
+        assert_eq!(SidebarCursor::NewRequest.saved_index(), None);
+        assert_eq!(SidebarCursor::Saved(0).saved_index(), Some(0));
+        assert_eq!(SidebarCursor::Saved(7).saved_index(), Some(7));
+    }
+
+    // ----- Serde roundtrip -----
+
+    #[test]
+    fn saved_request_roundtrip() {
+        let req = SavedRequest {
+            name: Some("greet".into()),
+            method: HttpMethod::Post,
+            url: "https://example.com/x".into(),
+            params: vec![kv(true, "p", "1"), kv(false, "q", "2")],
+            headers: vec![kv(true, "Accept", "application/json")],
+            body: "{\"hello\":\"world\"}".into(),
+            last_response: Some(ResponseDisplay {
+                status: 200,
+                status_text: "OK".into(),
+                body: "{}".into(),
+                elapsed_ms: 42,
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: SavedRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, req.name);
+        assert_eq!(back.method, req.method);
+        assert_eq!(back.url, req.url);
+        assert_eq!(back.params, req.params);
+        assert_eq!(back.headers, req.headers);
+        assert_eq!(back.body, req.body);
+        let r = back.last_response.unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.elapsed_ms, 42);
+    }
+
+    #[test]
+    fn saved_request_name_defaults_when_absent() {
+        let json = r#"{
+            "method": "Get",
+            "url": "",
+            "params": [],
+            "headers": [],
+            "body": "",
+            "last_response": null
+        }"#;
+        let req: SavedRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, None);
+        assert_eq!(req.method, HttpMethod::Get);
+    }
+}
