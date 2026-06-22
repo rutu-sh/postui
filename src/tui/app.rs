@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
 use std::thread;
@@ -380,6 +381,32 @@ impl KvEditor {
         }
     }
 
+    /// Backspace, removing a whole trailing `$[...]` reference token at once.
+    fn backspace_ref_or_char(&mut self) {
+        if self.is_text_cell() && self.cur_pos > 0 {
+            if let Some(len) = ref_token_len_before(&self.current_cell()[..self.cur_pos]) {
+                let start = self.cur_pos - len;
+                let end = self.cur_pos;
+                self.current_cell_mut().replace_range(start..end, "");
+                self.cur_pos = start;
+                return;
+            }
+        }
+        self.backspace();
+    }
+
+    /// Forward-delete, removing a whole leading `$[...]` reference token at once.
+    fn delete_ref_or_char(&mut self) {
+        if self.is_text_cell() {
+            let pos = self.cur_pos;
+            if let Some(len) = ref_token_len_after(&self.current_cell()[pos..]) {
+                self.current_cell_mut().replace_range(pos..pos + len, "");
+                return;
+            }
+        }
+        self.delete();
+    }
+
     fn move_left(&mut self) {
         match self.cur_col {
             KvColumn::Enabled => {}
@@ -622,6 +649,9 @@ pub struct App {
     rename_input_area: Cell<Rect>,
     path_input: Option<PathInputState>,
     footer_area: Cell<Rect>,
+    drafts: HashMap<String, Draft>,
+    ref_dropdown: Option<RefDropdown>,
+    ref_dropdown_area: Cell<Rect>,
 }
 
 #[derive(Debug)]
@@ -629,6 +659,45 @@ struct RenameState {
     target: usize,
     text: String,
     cursor: usize,
+}
+
+/// Unsaved working copy of a request, held in memory so edits survive switching
+/// between requests. A request shows a dirty marker while a draft differs from
+/// its persisted form.
+#[derive(Debug, Clone, PartialEq)]
+struct Draft {
+    method: HttpMethod,
+    url: String,
+    params: Vec<KvRow>,
+    headers: Vec<KvRow>,
+    body: String,
+}
+
+/// Which text field the `$[` reference dropdown is completing into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefTarget {
+    Url,
+    Kv,
+    Body,
+}
+
+/// Stage of the chained `$[` autocomplete. Selecting at one stage inserts text
+/// and advances to the next: request → `.response` field → response key.
+#[derive(Debug, Clone)]
+enum RefStage {
+    Request,
+    Field { id: String },
+    Key { id: String },
+}
+
+/// Active `$[` autocomplete: lists candidates for the current stage; selecting a
+/// request inserts its (hidden) id, so the user only ever sees the name.
+#[derive(Debug)]
+struct RefDropdown {
+    target: RefTarget,
+    stage: RefStage,
+    query: String,
+    index: usize,
 }
 
 #[derive(Debug)]
@@ -693,6 +762,9 @@ impl Default for App {
             rename_input_area: Cell::new(Rect::default()),
             path_input: None,
             footer_area: Cell::new(Rect::default()),
+            drafts: HashMap::new(),
+            ref_dropdown: None,
+            ref_dropdown_area: Cell::new(Rect::default()),
         }
     }
 }
@@ -711,6 +783,8 @@ impl App {
         frame.render_widget(self, frame.area());
         if self.method_dropdown_open {
             self.render_method_dropdown(frame);
+        } else if self.ref_dropdown.is_some() {
+            self.render_ref_dropdown(frame);
         } else if self.path_input.is_some() {
             self.render_path_input_cursor(frame);
         } else if self.focus == Focus::Url {
@@ -827,6 +901,11 @@ impl App {
             return;
         }
 
+        if self.ref_dropdown.is_some() {
+            self.handle_ref_dropdown_key(key);
+            return;
+        }
+
         match self.focus {
             Focus::Url => self.handle_url_key(key),
             Focus::Params => self.handle_params_key(key),
@@ -879,14 +958,20 @@ impl App {
             KeyCode::Home => self.url_cursor = 0,
             KeyCode::End => self.url_cursor = self.url.len(),
             KeyCode::Backspace => {
-                if self.url_cursor > 0 {
+                if let Some(len) = ref_token_len_before(&self.url[..self.url_cursor]) {
+                    let start = self.url_cursor - len;
+                    self.url.replace_range(start..self.url_cursor, "");
+                    self.url_cursor = start;
+                } else if self.url_cursor > 0 {
                     let prev = self.url[..self.url_cursor].chars().next_back().unwrap();
                     self.url_cursor -= prev.len_utf8();
                     self.url.remove(self.url_cursor);
                 }
             }
             KeyCode::Delete => {
-                if self.url_cursor < self.url.len() {
+                if let Some(len) = ref_token_len_after(&self.url[self.url_cursor..]) {
+                    self.url.replace_range(self.url_cursor..self.url_cursor + len, "");
+                } else if self.url_cursor < self.url.len() {
                     self.url.remove(self.url_cursor);
                 }
             }
@@ -894,6 +979,9 @@ impl App {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                     self.url.insert(self.url_cursor, c);
                     self.url_cursor += c.len_utf8();
+                    if c == '[' {
+                        self.try_trigger_ref_dropdown(RefTarget::Url);
+                    }
                 }
             }
             _ => {}
@@ -968,54 +1056,61 @@ impl App {
             return;
         }
 
-        let ed = self.active_kv_editor_mut();
-        match key.code {
-            KeyCode::Up => {
-                ed.move_up();
-            }
-            KeyCode::Down => ed.move_down(),
-            KeyCode::Left => ed.move_left(),
-            KeyCode::Right => ed.move_right(),
-            KeyCode::Tab => ed.advance_cell(),
-            KeyCode::BackTab => ed.retreat_cell(),
-            KeyCode::Home => ed.move_home(),
-            KeyCode::End => ed.move_end(),
-            KeyCode::PageUp => {
-                let page = kv_viewport.max(1);
-                for _ in 0..page {
-                    if !ed.move_up() {
-                        break;
+        let mut typed_bracket = false;
+        {
+            let ed = self.active_kv_editor_mut();
+            match key.code {
+                KeyCode::Up => {
+                    ed.move_up();
+                }
+                KeyCode::Down => ed.move_down(),
+                KeyCode::Left => ed.move_left(),
+                KeyCode::Right => ed.move_right(),
+                KeyCode::Tab => ed.advance_cell(),
+                KeyCode::BackTab => ed.retreat_cell(),
+                KeyCode::Home => ed.move_home(),
+                KeyCode::End => ed.move_end(),
+                KeyCode::PageUp => {
+                    let page = kv_viewport.max(1);
+                    for _ in 0..page {
+                        if !ed.move_up() {
+                            break;
+                        }
                     }
                 }
-            }
-            KeyCode::PageDown => {
-                let page = kv_viewport.max(1);
-                for _ in 0..page {
-                    ed.move_down();
+                KeyCode::PageDown => {
+                    let page = kv_viewport.max(1);
+                    for _ in 0..page {
+                        ed.move_down();
+                    }
                 }
-            }
-            KeyCode::Enter => {
-                if ed.cur_col == KvColumn::Enabled {
+                KeyCode::Enter => {
+                    if ed.cur_col == KvColumn::Enabled {
+                        ed.toggle_enabled();
+                    } else {
+                        ed.advance_cell();
+                    }
+                }
+                KeyCode::Char(' ') if ed.cur_col == KvColumn::Enabled => {
                     ed.toggle_enabled();
-                } else {
-                    ed.advance_cell();
                 }
-            }
-            KeyCode::Char(' ') if ed.cur_col == KvColumn::Enabled => {
-                ed.toggle_enabled();
-            }
-            KeyCode::Backspace => ed.backspace(),
-            KeyCode::Delete => ed.delete(),
-            KeyCode::Char(c) => {
-                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                    && ed.is_text_cell()
-                {
-                    ed.insert_char(c);
+                KeyCode::Backspace => ed.backspace_ref_or_char(),
+                KeyCode::Delete => ed.delete_ref_or_char(),
+                KeyCode::Char(c) => {
+                    if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && ed.is_text_cell()
+                    {
+                        ed.insert_char(c);
+                        typed_bracket = c == '[';
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            ed.ensure_visible(kv_viewport);
         }
-        ed.ensure_visible(kv_viewport);
+        if typed_bracket {
+            self.try_trigger_ref_dropdown(RefTarget::Kv);
+        }
     }
 
     fn handle_body_editor_key(&mut self, key: KeyEvent) {
@@ -1044,8 +1139,31 @@ impl App {
                 }
             }
             KeyCode::Enter => self.body_buf.insert_newline(),
-            KeyCode::Backspace => self.body_buf.backspace(),
-            KeyCode::Delete => self.body_buf.delete(),
+            KeyCode::Backspace => {
+                let b = &mut self.body_buf;
+                let col = b.cursor_col;
+                match (col > 0)
+                    .then(|| ref_token_len_before(&b.lines[b.cursor_row][..col]))
+                    .flatten()
+                {
+                    Some(len) => {
+                        let start = col - len;
+                        b.lines[b.cursor_row].replace_range(start..col, "");
+                        b.cursor_col = start;
+                    }
+                    None => b.backspace(),
+                }
+            }
+            KeyCode::Delete => {
+                let b = &mut self.body_buf;
+                let col = b.cursor_col;
+                match ref_token_len_after(&b.lines[b.cursor_row][col..]) {
+                    Some(len) => {
+                        b.lines[b.cursor_row].replace_range(col..col + len, "");
+                    }
+                    None => b.delete(),
+                }
+            }
             KeyCode::Tab => {
                 self.body_buf.insert_char(' ');
                 self.body_buf.insert_char(' ');
@@ -1053,6 +1171,9 @@ impl App {
             KeyCode::Char(c) => {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                     self.body_buf.insert_char(c);
+                    if c == '[' {
+                        self.try_trigger_ref_dropdown(RefTarget::Body);
+                    }
                 }
             }
             _ => {}
@@ -1317,6 +1438,254 @@ impl App {
         }
     }
 
+    /// Open the `$[` reference dropdown when the text just before the cursor in
+    /// the given target ends with the `$[` trigger.
+    fn try_trigger_ref_dropdown(&mut self, target: RefTarget) {
+        let trigger = {
+            let before: &str = match target {
+                RefTarget::Url => &self.url[..self.url_cursor],
+                RefTarget::Body => {
+                    let b = &self.body_buf;
+                    &b.lines[b.cursor_row][..b.cursor_col]
+                }
+                RefTarget::Kv => {
+                    let ed = self.active_kv_editor();
+                    &ed.current_cell()[..ed.cur_pos]
+                }
+            };
+            before.ends_with("$[")
+        };
+        if trigger {
+            self.ref_dropdown = Some(RefDropdown {
+                target,
+                stage: RefStage::Request,
+                query: String::new(),
+                index: 0,
+            });
+        }
+    }
+
+    /// Candidates for the current dropdown stage, filtered by the typed query,
+    /// as (display label, value) pairs. `value` is the request id, field name,
+    /// or response key depending on stage.
+    fn ref_items(&self) -> Vec<(String, String)> {
+        let Some(rd) = self.ref_dropdown.as_ref() else {
+            return Vec::new();
+        };
+        let query = rd.query.to_lowercase();
+        let matches = |s: &str| query.is_empty() || s.to_lowercase().contains(&query);
+        match &rd.stage {
+            RefStage::Request => self
+                .requests
+                .iter()
+                .filter_map(|r| {
+                    let name = r.name.clone().unwrap_or_else(|| r.url.clone());
+                    matches(&name).then(|| (name, r.id.clone()))
+                })
+                .collect(),
+            RefStage::Field { id } => {
+                // Only offer `response` when there is a stored response to read.
+                let has_response = self
+                    .requests
+                    .iter()
+                    .find(|r| &r.id == id)
+                    .map(|r| r.last_response.is_some())
+                    .unwrap_or(false);
+                if has_response && matches("response") {
+                    vec![("response".to_string(), "response".to_string())]
+                } else {
+                    Vec::new()
+                }
+            }
+            RefStage::Key { id } => self
+                .response_keys(id)
+                .into_iter()
+                .filter(|k| matches(k))
+                .map(|k| (k.clone(), k))
+                .collect(),
+        }
+    }
+
+    /// Top-level keys of a request's stored JSON response (empty if none/invalid).
+    fn response_keys(&self, id: &str) -> Vec<String> {
+        self.requests
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.last_response.as_ref())
+            .and_then(|resp| serde_json::from_str::<serde_json::Value>(&resp.body).ok())
+            .and_then(|v| {
+                v.as_object()
+                    .map(|m| m.keys().cloned().collect::<Vec<_>>())
+            })
+            .unwrap_or_default()
+    }
+
+    fn handle_ref_dropdown_key(&mut self, key: KeyEvent) {
+        let items = self.ref_items();
+        match key.code {
+            KeyCode::Esc => self.ref_dropdown = None,
+            KeyCode::Up => {
+                if let Some(d) = self.ref_dropdown.as_mut() {
+                    if d.index > 0 {
+                        d.index -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(d) = self.ref_dropdown.as_mut() {
+                    if d.index + 1 < items.len() {
+                        d.index += 1;
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Tab => self.commit_ref_selection(&items),
+            KeyCode::Backspace => {
+                let close = match self.ref_dropdown.as_mut() {
+                    Some(d) if !d.query.is_empty() => {
+                        d.query.pop();
+                        d.index = 0;
+                        false
+                    }
+                    _ => true,
+                };
+                if close {
+                    self.ref_dropdown = None;
+                }
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                    if let Some(d) = self.ref_dropdown.as_mut() {
+                        d.query.push(c);
+                        d.index = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the highlighted candidate: insert its text into the active target
+    /// and advance the dropdown to the next stage (request → field → key), or
+    /// close it after a key is chosen.
+    fn commit_ref_selection(&mut self, items: &[(String, String)]) {
+        let idx = self.ref_dropdown.as_ref().map(|d| d.index).unwrap_or(0);
+        let stage = self.ref_dropdown.as_ref().map(|d| d.stage.clone());
+        let Some((_, value)) = items.get(idx).cloned() else {
+            self.ref_dropdown = None;
+            return;
+        };
+        match stage {
+            Some(RefStage::Request) => {
+                // Complete `$[` with the hidden id and move on to the field stage.
+                self.insert_at_cursor(&format!("{value}]"));
+                if let Some(d) = self.ref_dropdown.as_mut() {
+                    d.stage = RefStage::Field { id: value };
+                    d.query.clear();
+                    d.index = 0;
+                }
+            }
+            Some(RefStage::Field { id }) => {
+                self.insert_at_cursor(".response");
+                if let Some(d) = self.ref_dropdown.as_mut() {
+                    d.stage = RefStage::Key { id };
+                    d.query.clear();
+                    d.index = 0;
+                }
+            }
+            Some(RefStage::Key { .. }) => {
+                self.insert_at_cursor(&format!(".\"{value}\""));
+                self.ref_dropdown = None;
+            }
+            None => self.ref_dropdown = None,
+        }
+    }
+
+    /// Insert `text` at the cursor of the active reference target.
+    fn insert_at_cursor(&mut self, text: &str) {
+        let Some(target) = self.ref_dropdown.as_ref().map(|d| d.target) else {
+            return;
+        };
+        match target {
+            RefTarget::Url => {
+                for c in text.chars() {
+                    self.url.insert(self.url_cursor, c);
+                    self.url_cursor += c.len_utf8();
+                }
+            }
+            RefTarget::Body => {
+                for c in text.chars() {
+                    self.body_buf.insert_char(c);
+                }
+            }
+            RefTarget::Kv => {
+                let ed = self.active_kv_editor_mut();
+                for c in text.chars() {
+                    ed.insert_char(c);
+                }
+            }
+        }
+    }
+
+    /// Screen cell of the editing cursor for the active ref target, used to
+    /// anchor the dropdown popup just below it.
+    fn ref_anchor(&self) -> Option<(u16, u16)> {
+        let target = self.ref_dropdown.as_ref()?.target;
+        match target {
+            RefTarget::Url => {
+                let area = self.url_area.get();
+                if area.width < 2 {
+                    return None;
+                }
+                let offset = self.display_refs(&self.url[..self.url_cursor]).chars().count() as u16;
+                let x = (area.x + 1)
+                    .saturating_add(offset)
+                    .min(area.x + area.width - 2);
+                Some((x, area.y))
+            }
+            RefTarget::Body => {
+                let area = self.editor_area.get();
+                if area.width == 0 || area.height == 0 {
+                    return None;
+                }
+                let b = &self.body_buf;
+                let row = b.cursor_row.saturating_sub(b.scroll_y);
+                let col = self
+                    .display_refs(&b.lines[b.cursor_row][..b.cursor_col])
+                    .chars()
+                    .count() as u16;
+                Some((
+                    (area.x + col).min(area.x + area.width.saturating_sub(1)),
+                    area.y + row as u16,
+                ))
+            }
+            RefTarget::Kv => {
+                let area = self.editor_area.get();
+                if area.width < 14 || area.height < 3 {
+                    return None;
+                }
+                let ed = self.active_kv_editor();
+                let cb_w: u16 = 5;
+                let remaining = area.width - cb_w;
+                let key_w = remaining / 2;
+                let key_x = area.x + cb_w;
+                let value_x = key_x + key_w;
+                let (cell_x, cell_w) = match ed.cur_col {
+                    KvColumn::Value => (value_x, remaining - key_w),
+                    _ => (key_x, key_w),
+                };
+                let offset = self
+                    .display_refs(&ed.current_cell()[..ed.cur_pos])
+                    .chars()
+                    .count() as u16;
+                let x = (cell_x + 1)
+                    .saturating_add(offset)
+                    .min(cell_x + cell_w.saturating_sub(1));
+                let row = ed.cur_row.saturating_sub(ed.scroll_y) as u16;
+                Some((x, area.y + 2 + row))
+            }
+        }
+    }
+
     fn toggle_sidebar_focus(&mut self) {
         if !self.show_sidebar {
             self.show_sidebar = true;
@@ -1456,11 +1825,21 @@ impl App {
         }
 
         let (tx, rx) = mpsc::channel();
-        let url = self.url.clone();
+        let url = self.resolve_references(&self.url);
         let method = self.method.as_str().to_string();
-        let params = self.params_kv.entries();
-        let headers = self.headers_kv.entries();
-        let body = self.body_buf.text();
+        let params: Vec<(String, String)> = self
+            .params_kv
+            .entries()
+            .into_iter()
+            .map(|(k, v)| (self.resolve_references(&k), self.resolve_references(&v)))
+            .collect();
+        let headers: Vec<(String, String)> = self
+            .headers_kv
+            .entries()
+            .into_iter()
+            .map(|(k, v)| (self.resolve_references(&k), self.resolve_references(&v)))
+            .collect();
+        let body = self.resolve_references(&self.body_buf.text());
         let allow_body = self.method.allows_body();
 
         self.response = ResponseState::InFlight;
@@ -1511,26 +1890,13 @@ impl App {
         self.exit = true;
     }
 
-    fn is_current_dirty(&self) -> bool {
-        let Some(idx) = self.current_request_idx else {
-            return false;
-        };
-        let Some(saved) = self.requests.get(idx) else {
-            return false;
-        };
-        saved.method != self.method
-            || saved.url != self.url
-            || !kv_rows_equivalent(&saved.params, &self.params_kv.rows)
-            || !kv_rows_equivalent(&saved.headers, &self.headers_kv.rows)
-            || saved.body != self.body_buf.text()
-    }
-
     fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now()));
     }
 
     fn save_state(&mut self) {
         let snapshot = SavedRequest {
+            id: new_id(),
             name: None,
             method: self.method,
             url: self.url.clone(),
@@ -1545,11 +1911,19 @@ impl App {
 
         if let Some(idx) = self.current_request_idx {
             if idx < self.requests.len() {
+                let preserved_id = self.requests[idx].id.clone();
                 let preserved_name = self.requests[idx].name.clone();
-                let updated = SavedRequest { name: preserved_name, ..snapshot };
+                let updated = SavedRequest {
+                    id: preserved_id.clone(),
+                    name: preserved_name,
+                    ..snapshot
+                };
                 let prev = std::mem::replace(&mut self.requests[idx], updated);
                 match self.persist_collection() {
-                    Ok(()) => self.set_status(format!("updated entry {}", idx + 1)),
+                    Ok(()) => {
+                        self.drafts.remove(&preserved_id);
+                        self.set_status(format!("updated entry {}", idx + 1));
+                    }
                     Err(e) => {
                         self.requests[idx] = prev;
                         self.set_status(format!("save failed — {e}"));
@@ -1596,6 +1970,7 @@ impl App {
         match result {
             Ok(loaded) => {
                 self.requests = loaded;
+                self.drafts.clear();
                 if self.requests.is_empty() {
                     self.sidebar_cursor = SidebarCursor::NewRequest;
                     self.current_request_idx = None;
@@ -1633,6 +2008,7 @@ impl App {
         let Some(idx) = self.sidebar_cursor.saved_index() else {
             return;
         };
+        self.capture_current_draft();
         let Some(req) = self.requests.get(idx).cloned() else {
             return;
         };
@@ -1641,12 +2017,22 @@ impl App {
             .clone()
             .unwrap_or_else(|| truncate_for_display(&req.url, 40));
         let label = format!("loaded {} {}", req.method.as_str(), label_target);
-        self.method = req.method;
-        self.url = req.url;
+        // Prefer an in-memory draft (unsaved edits) over the persisted form.
+        let draft = self.drafts.get(&req.id).cloned();
+        if let Some(d) = draft {
+            self.method = d.method;
+            self.url = d.url;
+            self.params_kv = KvEditor::from_rows(d.params);
+            self.headers_kv = KvEditor::from_rows(d.headers);
+            self.body_buf = TextBuffer::from_text(&d.body);
+        } else {
+            self.method = req.method;
+            self.url = req.url;
+            self.params_kv = KvEditor::from_rows(req.params);
+            self.headers_kv = KvEditor::from_rows(req.headers);
+            self.body_buf = TextBuffer::from_text(&req.body);
+        }
         self.url_cursor = self.url.len();
-        self.params_kv = KvEditor::from_rows(req.params);
-        self.headers_kv = KvEditor::from_rows(req.headers);
-        self.body_buf = TextBuffer::from_text(&req.body);
         self.response = match req.last_response {
             Some(d) => ResponseState::Done(d),
             None => ResponseState::Empty,
@@ -1665,6 +2051,7 @@ impl App {
             return;
         }
         let removed = self.requests.remove(idx);
+        self.drafts.remove(&removed.id);
         if self.requests.is_empty() {
             self.sidebar_cursor = SidebarCursor::NewRequest;
         } else if idx >= self.requests.len() {
@@ -1689,6 +2076,7 @@ impl App {
     }
 
     fn new_request(&mut self) {
+        self.capture_current_draft();
         self.method = HttpMethod::Get;
         self.url = String::new();
         self.url_cursor = 0;
@@ -1764,12 +2152,6 @@ impl App {
             0
         };
 
-        let dirty_idx: Option<usize> = if self.is_current_dirty() {
-            self.current_request_idx
-        } else {
-            None
-        };
-
         let method_w: u16 = 8;
         for display_i in 0..max_items {
             let logical_row = scroll + display_i;
@@ -1840,7 +2222,7 @@ impl App {
                 continue;
             }
 
-            let is_dirty = dirty_idx == Some(i);
+            let is_dirty = self.is_request_dirty(i);
             let label = req.name.clone().unwrap_or_else(|| req.url.clone());
             let marker = if is_dirty {
                 "*"
@@ -2094,14 +2476,21 @@ impl App {
             if key_active {
                 Block::new().bg(Color::DarkGray).render(key_cell, buf);
             }
-            Paragraph::new(cell_line(&row.key, "(key)", disabled, key_active)).render(key_cell, buf);
+            Paragraph::new(cell_line(&self.display_refs(&row.key), "(key)", disabled, key_active))
+                .render(key_cell, buf);
 
             let value_active = is_active_row && ed.cur_col == KvColumn::Value;
             let value_cell = Rect { x: value_x, y, width: value_w, height: 1 };
             if value_active {
                 Block::new().bg(Color::DarkGray).render(value_cell, buf);
             }
-            Paragraph::new(cell_line(&row.value, "(value)", disabled, value_active)).render(value_cell, buf);
+            Paragraph::new(cell_line(
+                &self.display_refs(&row.value),
+                "(value)",
+                disabled,
+                value_active,
+            ))
+            .render(value_cell, buf);
         }
     }
 
@@ -2129,7 +2518,7 @@ impl App {
             .iter()
             .skip(text_buf.scroll_y)
             .take(area.height as usize)
-            .map(|s| Line::from(s.as_str()))
+            .map(|s| Line::from(self.display_refs(s)))
             .collect();
         Paragraph::new(lines).render(area, buf);
     }
@@ -2173,7 +2562,7 @@ impl App {
             KvColumn::Enabled => return,
         };
         let pos = ed.cur_pos.min(cell_text.len());
-        let char_col = cell_text[..pos].chars().count() as u16;
+        let char_col = self.display_refs(&cell_text[..pos]).chars().count() as u16;
 
         let (cell_x, cell_width) = match ed.cur_col {
             KvColumn::Key => (key_x, key_w),
@@ -2198,7 +2587,7 @@ impl App {
         }
         let line = &text_buf.lines[text_buf.cursor_row];
         let col_bytes = text_buf.cursor_col.min(line.len());
-        let char_col = line[..col_bytes].chars().count();
+        let char_col = self.display_refs(&line[..col_bytes]).chars().count();
         if char_col >= area.width as usize {
             return;
         }
@@ -2356,7 +2745,7 @@ impl App {
             width: area.width - 2,
             height: area.height,
         };
-        Paragraph::new(self.url.as_str()).render(text_area, buf);
+        Paragraph::new(self.display_refs(&self.url)).render(text_area, buf);
     }
 
     fn render_send_cell(&self, area: Rect, buf: &mut Buffer) {
@@ -2386,7 +2775,7 @@ impl App {
         if area.width < 2 || area.height == 0 {
             return;
         }
-        let char_offset = self.url[..self.url_cursor].chars().count() as u16;
+        let char_offset = self.display_refs(&self.url[..self.url_cursor]).chars().count() as u16;
         let text_x = area.x + 1;
         let max_x = area.x + area.width - 2;
         let cursor_x = text_x.saturating_add(char_offset).min(max_x);
@@ -2434,6 +2823,221 @@ impl App {
             .border_style(Style::default().fg(Color::LightCyan));
         frame.render_widget(Paragraph::new(lines).block(block), dropdown_area);
     }
+
+    fn render_ref_dropdown(&self, frame: &mut Frame) {
+        let Some((ax, ay)) = self.ref_anchor() else {
+            return;
+        };
+        let items = self.ref_items();
+        let (stage_label, empty_label) = match self.ref_dropdown.as_ref().map(|d| &d.stage) {
+            Some(RefStage::Request) => (" request ", "(no match)"),
+            Some(RefStage::Field { .. }) => (" field ", "(no response)"),
+            Some(RefStage::Key { .. }) => (" key ", "(no keys)"),
+            None => (" ", ""),
+        };
+        let query = self
+            .ref_dropdown
+            .as_ref()
+            .map(|d| d.query.as_str())
+            .unwrap_or("");
+        let selected = self.ref_dropdown.as_ref().map(|d| d.index).unwrap_or(0);
+
+        let title = if query.is_empty() {
+            stage_label.to_string()
+        } else {
+            format!(" {query} ")
+        };
+        let mut content_w = title.chars().count();
+        let rows: Vec<String> = if items.is_empty() {
+            vec![empty_label.to_string()]
+        } else {
+            items
+                .iter()
+                .map(|(label, _)| truncate_for_display(label, 30))
+                .collect()
+        };
+        for r in &rows {
+            content_w = content_w.max(r.chars().count() + 1);
+        }
+        let width = (content_w as u16 + 2).clamp(10, 40);
+        let height = (rows.len() as u16 + 2).min(10);
+
+        let desired = Rect { x: ax, y: ay + 1, width, height };
+        let area = desired.intersection(frame.area());
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.ref_dropdown_area.set(area);
+        frame.render_widget(Clear, area);
+
+        let lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut style = if items.is_empty() {
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                if i == selected && !items.is_empty() {
+                    style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+                }
+                Line::from(format!(" {name}")).style(style)
+            })
+            .collect();
+
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::LightMagenta))
+            .title(Span::styled(
+                title,
+                Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    /// Translate stored `$[<id>]` reference tokens to `$[<name>]` for display.
+    /// Unknown ids are left untouched. Used everywhere request text is rendered
+    /// so the user only ever sees names.
+    fn display_refs(&self, text: &str) -> String {
+        if !text.contains("$[") {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            if text[i..].starts_with("$[") {
+                if let Some(rel) = text[i + 2..].find(']') {
+                    let id = &text[i + 2..i + 2 + rel];
+                    if let Some(req) = self.requests.iter().find(|r| r.id == id) {
+                        let name = req.name.clone().unwrap_or_else(|| req.url.clone());
+                        out.push_str("$[");
+                        out.push_str(&name);
+                        out.push(']');
+                        i += 2 + rel + 1;
+                        continue;
+                    }
+                }
+            }
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// Resolve `$[<id>].response."<key>"` references against saved responses,
+    /// substituting the value of `<key>` in the referenced request's last
+    /// response body (empty string when missing). Applied to outgoing text.
+    fn resolve_references(&self, input: &str) -> String {
+        if !input.contains("$[") {
+            return input.to_string();
+        }
+        let mut out = String::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if input[i..].starts_with("$[") {
+                if let Some((consumed, value)) = self.try_parse_ref(&input[i..]) {
+                    out.push_str(&value);
+                    i += consumed;
+                    continue;
+                }
+            }
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// Parse a single `$[id].response."key"` (or `.response.key`) span at the
+    /// start of `s`. Returns (bytes consumed, resolved value). Returns None when
+    /// the span isn't a complete reference, leaving the text untouched.
+    fn try_parse_ref(&self, s: &str) -> Option<(usize, String)> {
+        let close = s[2..].find(']')? + 2;
+        let id = &s[2..close];
+        let rest = &s[close + 1..];
+        let after = rest.strip_prefix(".response.")?;
+
+        let (key, consumed_key) = if let Some(q) = after.strip_prefix('"') {
+            let end = q.find('"')?;
+            (&q[..end], 1 + end + 1)
+        } else {
+            let end = after
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(after.len());
+            if end == 0 {
+                return None;
+            }
+            (&after[..end], end)
+        };
+
+        let consumed = close + 1 + ".response.".len() + consumed_key;
+        let value = self.lookup_response_value(id, key);
+        Some((consumed, value))
+    }
+
+    fn lookup_response_value(&self, id: &str, key: &str) -> String {
+        let Some(req) = self.requests.iter().find(|r| r.id == id) else {
+            return String::new();
+        };
+        let Some(resp) = req.last_response.as_ref() else {
+            return String::new();
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp.body) else {
+            return String::new();
+        };
+        match json.get(key) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        }
+    }
+
+    // ----- Per-request drafts (in-memory unsaved edits) -----
+
+    fn live_draft(&self) -> Draft {
+        Draft {
+            method: self.method,
+            url: self.url.clone(),
+            params: self.params_kv.rows.clone(),
+            headers: self.headers_kv.rows.clone(),
+            body: self.body_buf.text(),
+        }
+    }
+
+    /// Stash the current editor state as a draft for the loaded request when it
+    /// differs from what's saved (so edits survive switching away); otherwise
+    /// drop any stale draft.
+    fn capture_current_draft(&mut self) {
+        let Some(idx) = self.current_request_idx else {
+            return;
+        };
+        let Some(saved) = self.requests.get(idx) else {
+            return;
+        };
+        let id = saved.id.clone();
+        let draft = self.live_draft();
+        if draft_differs(saved, &draft) {
+            self.drafts.insert(id, draft);
+        } else {
+            self.drafts.remove(&id);
+        }
+    }
+
+    fn is_request_dirty(&self, i: usize) -> bool {
+        let Some(saved) = self.requests.get(i) else {
+            return false;
+        };
+        if self.current_request_idx == Some(i) {
+            draft_differs(saved, &self.live_draft())
+        } else {
+            self.drafts
+                .get(&saved.id)
+                .map(|d| draft_differs(saved, d))
+                .unwrap_or(false)
+        }
+    }
 }
 
 fn cell_line<'a>(text: &'a str, placeholder: &'a str, disabled: bool, active: bool) -> Line<'a> {
@@ -2457,6 +3061,8 @@ fn cell_line<'a>(text: &'a str, placeholder: &'a str, disabled: bool, active: bo
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedRequest {
+    #[serde(default = "new_id")]
+    id: String,
     #[serde(default)]
     name: Option<String>,
     method: HttpMethod,
@@ -2467,6 +3073,31 @@ struct SavedRequest {
     last_response: Option<ResponseDisplay>,
 }
 
+/// Generate a process-unique 128-bit identifier rendered as 32 hex chars.
+/// Abstracted from the user — requests are referenced by name in the UI but
+/// stored/resolved by this stable id.
+fn new_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+    let mut x = nanos ^ count.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (pid << 17);
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let a = next();
+    let b = next();
+    format!("{a:016x}{b:016x}")
+}
+
 fn collection_file_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     std::path::PathBuf::from(home).join(".postui_collection.json")
@@ -2475,7 +3106,17 @@ fn collection_file_path() -> std::path::PathBuf {
 fn load_collection_from_disk() -> Vec<SavedRequest> {
     let path = collection_file_path();
     match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Ok(content) => {
+            let requests: Vec<SavedRequest> = serde_json::from_str(&content).unwrap_or_default();
+            // Pre-id collections get fresh ids on load; persist once so the ids
+            // are stable across restarts (otherwise references would break).
+            if !requests.is_empty() && !content.contains("\"id\"") {
+                if let Ok(json) = serde_json::to_string_pretty(&requests) {
+                    let _ = std::fs::write(&path, json);
+                }
+            }
+            requests
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -2530,6 +3171,37 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     } else {
         Err(last_err)
     }
+}
+
+/// If `before` (text up to the cursor) ends with a complete `$[...]` reference
+/// token, return its byte length so it can be deleted as a single unit. This
+/// keeps the hidden id from being exposed when the user backspaces through what
+/// looks (in the display) like a short `$[name]`.
+fn ref_token_len_before(before: &str) -> Option<usize> {
+    let inner_end = before.strip_suffix(']')?.len();
+    let start = before[..inner_end].rfind("$[")?;
+    if before[start + 2..inner_end].contains(']') {
+        return None;
+    }
+    Some(before.len() - start)
+}
+
+/// If `after` (text from the cursor on) starts with a complete `$[...]` token,
+/// return its byte length so forward-delete removes it as a unit.
+fn ref_token_len_after(after: &str) -> Option<usize> {
+    if !after.starts_with("$[") {
+        return None;
+    }
+    let rel = after[2..].find(']')?;
+    Some(2 + rel + 1)
+}
+
+fn draft_differs(saved: &SavedRequest, d: &Draft) -> bool {
+    saved.method != d.method
+        || saved.url != d.url
+        || !kv_rows_equivalent(&saved.params, &d.params)
+        || !kv_rows_equivalent(&saved.headers, &d.headers)
+        || saved.body != d.body
 }
 
 fn kv_rows_equivalent(a: &[KvRow], b: &[KvRow]) -> bool {
@@ -2688,18 +3360,20 @@ impl Widget for &App {
                     )
                     .render(vchunks[i], buf);
             } else {
-                let hint: &str = if self.method_dropdown_open {
+                let hint: &str = if self.ref_dropdown.is_some() {
+                    " ↑/↓: navigate  enter/tab: select & continue  type: filter  esc: done "
+                } else if self.method_dropdown_open {
                     " ↑/↓: navigate  enter: select  esc: cancel "
                 } else {
                     match self.focus {
                         Focus::Method => " q/^C: quit  ^B: sidebar  ^S: save  ^O: load  tab: focus  enter: open method ",
-                        Focus::Url => " ^C: quit  ^B: sidebar  ^S: save  tab: focus  enter: send  type to edit ",
+                        Focus::Url => " ^C: quit  ^B: sidebar  ^S: save  enter: send  $[: ref  type to edit ",
                         Focus::Send => " q/^C: quit  ^B: sidebar  ^S: save  tab: focus  enter/space: send ",
                         Focus::Params => match self.params_sub_focus {
                             ParamsSubFocus::Tabs => " tab/→: next tab  shift+tab/←: prev tab  ↓/enter: edit  ^S: save  ^O: load ",
                             ParamsSubFocus::Editor => match self.active_tab {
-                                RequestTab::Body => " esc/↑: tabs  shift+tab: prev tab  tab: indent  ^S: save  ^O: load ",
-                                _ => " tab/⇧tab: next/prev cell  esc/↑: tabs  enter: next/toggle  space: toggle  ^D: del row ",
+                                RequestTab::Body => " esc/↑: tabs  tab: indent  $[: ref  ^S: save  ^O: load ",
+                                _ => " tab/⇧tab: cell  esc/↑: tabs  enter: next/toggle  $[: ref  ^D: del row ",
                             },
                         },
                         Focus::Response => " ↑/↓: scroll  PgUp/PgDn: page  c: copy  Home/End: top/bot  ⇧↑/⇧↓: resize ",
@@ -3116,6 +3790,7 @@ mod tests {
     #[test]
     fn saved_request_roundtrip() {
         let req = SavedRequest {
+            id: "req-greet-id".into(),
             name: Some("greet".into()),
             method: HttpMethod::Post,
             url: "https://example.com/x".into(),
@@ -3131,6 +3806,7 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: SavedRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, req.id);
         assert_eq!(back.name, req.name);
         assert_eq!(back.method, req.method);
         assert_eq!(back.url, req.url);
@@ -3155,5 +3831,211 @@ mod tests {
         let req: SavedRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, None);
         assert_eq!(req.method, HttpMethod::Get);
+        assert!(!req.id.is_empty());
+    }
+
+    // ----- Request ids -----
+
+    #[test]
+    fn new_id_is_unique_and_hex() {
+        let a = new_id();
+        let b = new_id();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ----- Reference display / resolution -----
+
+    fn saved_with_response(id: &str, name: &str, body: &str) -> SavedRequest {
+        SavedRequest {
+            id: id.into(),
+            name: Some(name.into()),
+            method: HttpMethod::Get,
+            url: "https://x".into(),
+            params: vec![],
+            headers: vec![],
+            body: String::new(),
+            last_response: Some(ResponseDisplay {
+                status: 200,
+                status_text: "OK".into(),
+                body: body.into(),
+                elapsed_ms: 1,
+            }),
+        }
+    }
+
+    fn app_with(requests: Vec<SavedRequest>) -> App {
+        let mut app = App::default();
+        app.requests = requests;
+        app.drafts.clear();
+        app.current_request_idx = None;
+        app
+    }
+
+    #[test]
+    fn display_refs_shows_name_for_known_id() {
+        let app = app_with(vec![saved_with_response("abc123", "login", "{}")]);
+        assert_eq!(app.display_refs("Bearer $[abc123]"), "Bearer $[login]");
+        // unknown id is left as-is
+        assert_eq!(app.display_refs("$[nope]"), "$[nope]");
+        // no token, untouched
+        assert_eq!(app.display_refs("plain text"), "plain text");
+    }
+
+    #[test]
+    fn resolve_references_quoted_key() {
+        let app = app_with(vec![saved_with_response(
+            "abc",
+            "login",
+            r#"{"token":"secret-xyz"}"#,
+        )]);
+        assert_eq!(
+            app.resolve_references(r#"Bearer $[abc].response."token""#),
+            "Bearer secret-xyz"
+        );
+    }
+
+    #[test]
+    fn resolve_references_unquoted_key_and_non_string() {
+        let app = app_with(vec![saved_with_response("abc", "login", r#"{"id":42}"#)]);
+        assert_eq!(app.resolve_references("$[abc].response.id"), "42");
+    }
+
+    #[test]
+    fn resolve_references_missing_key_is_empty() {
+        let app = app_with(vec![saved_with_response("abc", "login", r#"{"a":1}"#)]);
+        assert_eq!(app.resolve_references(r#"$[abc].response."missing""#), "");
+    }
+
+    #[test]
+    fn resolve_references_unknown_request_is_empty() {
+        let app = app_with(vec![]);
+        assert_eq!(app.resolve_references(r#"$[ghost].response."k""#), "");
+    }
+
+    #[test]
+    fn resolve_references_bare_token_left_untouched() {
+        let app = app_with(vec![saved_with_response("abc", "login", "{}")]);
+        // no `.response.<key>` suffix -> not a resolvable reference
+        assert_eq!(app.resolve_references("$[abc] tail"), "$[abc] tail");
+    }
+
+    #[test]
+    fn ref_token_len_before_matches_trailing_token() {
+        assert_eq!(ref_token_len_before("$[abc]"), Some(6));
+        assert_eq!(ref_token_len_before("Bearer $[abc]"), Some(6));
+        // no trailing token
+        assert_eq!(ref_token_len_before("$[abc"), None);
+        assert_eq!(ref_token_len_before("plain"), None);
+        // stray bracket that isn't part of a $[ token
+        assert_eq!(ref_token_len_before("$[a]b]"), None);
+    }
+
+    #[test]
+    fn ref_token_len_after_matches_leading_token() {
+        assert_eq!(ref_token_len_after("$[abc] tail"), Some(6));
+        assert_eq!(ref_token_len_after("x$[abc]"), None);
+        assert_eq!(ref_token_len_after("$[abc"), None);
+    }
+
+    #[test]
+    fn response_keys_lists_top_level_object_keys() {
+        let app = app_with(vec![saved_with_response(
+            "abc",
+            "login",
+            r#"{"token":"t","expires":99}"#,
+        )]);
+        let mut keys = app.response_keys("abc");
+        keys.sort();
+        assert_eq!(keys, vec!["expires".to_string(), "token".to_string()]);
+        // non-object / unknown -> empty
+        assert!(app.response_keys("ghost").is_empty());
+    }
+
+    fn with_stage(mut app: App, stage: RefStage, query: &str) -> App {
+        app.ref_dropdown = Some(RefDropdown {
+            target: RefTarget::Body,
+            stage,
+            query: query.into(),
+            index: 0,
+        });
+        app
+    }
+
+    #[test]
+    fn ref_items_request_stage_filters_by_name() {
+        let app = with_stage(
+            app_with(vec![
+                saved_with_response("id1", "login", "{}"),
+                saved_with_response("id2", "logout", "{}"),
+                saved_with_response("id3", "fetch", "{}"),
+            ]),
+            RefStage::Request,
+            "log",
+        );
+        let items: Vec<String> = app.ref_items().into_iter().map(|(label, _)| label).collect();
+        assert_eq!(items, vec!["login".to_string(), "logout".to_string()]);
+    }
+
+    #[test]
+    fn ref_items_field_stage_offers_response_only_with_stored_response() {
+        let mut req_no_resp = saved_with_response("id1", "login", "{}");
+        req_no_resp.last_response = None;
+        let app = with_stage(
+            app_with(vec![req_no_resp]),
+            RefStage::Field { id: "id1".into() },
+            "",
+        );
+        assert!(app.ref_items().is_empty());
+
+        let app = with_stage(
+            app_with(vec![saved_with_response("id1", "login", "{}")]),
+            RefStage::Field { id: "id1".into() },
+            "",
+        );
+        let items: Vec<String> = app.ref_items().into_iter().map(|(_, v)| v).collect();
+        assert_eq!(items, vec!["response".to_string()]);
+    }
+
+    #[test]
+    fn ref_items_key_stage_lists_response_keys() {
+        let app = with_stage(
+            app_with(vec![saved_with_response("id1", "login", r#"{"token":"t"}"#)]),
+            RefStage::Key { id: "id1".into() },
+            "tok",
+        );
+        let items: Vec<String> = app.ref_items().into_iter().map(|(_, v)| v).collect();
+        assert_eq!(items, vec!["token".to_string()]);
+    }
+
+    #[test]
+    fn kv_backspace_removes_whole_ref_token() {
+        let mut e = KvEditor::from_rows(vec![kv(true, "Authorization", "Bearer $[abc123]")]);
+        e.cur_col = KvColumn::Value;
+        e.cur_pos = e.rows[0].value.len();
+        e.backspace_ref_or_char();
+        assert_eq!(e.rows[0].value, "Bearer ");
+        // a second backspace now removes a single ordinary char
+        e.cur_pos = e.rows[0].value.len();
+        e.backspace_ref_or_char();
+        assert_eq!(e.rows[0].value, "Bearer");
+    }
+
+    // ----- Drafts -----
+
+    #[test]
+    fn draft_differs_detects_body_change() {
+        let saved = saved_with_response("id", "n", "{}");
+        let mut d = Draft {
+            method: saved.method,
+            url: saved.url.clone(),
+            params: saved.params.clone(),
+            headers: saved.headers.clone(),
+            body: saved.body.clone(),
+        };
+        assert!(!draft_differs(&saved, &d));
+        d.body = "changed".into();
+        assert!(draft_differs(&saved, &d));
     }
 }
